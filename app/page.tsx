@@ -4,6 +4,7 @@ import Badge from "@/components/Badge";
 import { useState } from "react";
 import Link from "next/link";
 import { MODELS, estimateUsd } from "@/lib/models";
+import { PROJECTS } from "@/lib/projects";
 
 export default function Explore() {
   const router = useRouter();
@@ -49,6 +50,18 @@ export default function Explore() {
               <p className="flex-1 text-sm text-muted">{m.desc}</p>
               <Link href={`/video?model=${m.id}`} className="rounded-xl bg-chip py-2 text-center text-sm font-semibold hover:bg-line">Generate</Link>
             </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="flex flex-col gap-4">
+        <h2 className="text-3xl font-black tracking-tight uppercase">More from the makers</h2>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {PROJECTS.map((p) => (
+            <a key={p.name} href={p.url} target="_blank" rel="noreferrer" className="group flex flex-col gap-2 rounded-2xl bg-panel p-4 hover:bg-chip">
+              <h3 className="font-bold group-hover:text-lime">{p.name} ↗</h3>
+              <p className="text-sm text-muted">{p.blurb}</p>
+            </a>
           ))}
         </div>
       </section>
