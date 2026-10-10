@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* Dark studio palette with a lime accent */
+@theme {
+  --color-bg: #0b0b0b;
+  --color-panel: #151515;
+  --color-chip: #1f1f1f;
+  --color-line: #2a2a2a;
+  --color-muted: #8a8a8f;
+  --color-fg: #f7f7f8;
+  --color-lime: #d1fe17;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+html { color-scheme: dark; }
+body { background: var(--color-bg); color: var(--color-fg); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 8px; }

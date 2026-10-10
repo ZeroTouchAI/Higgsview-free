@@ -1,0 +1,386 @@
+"use client";
+import { ask, askToPay } from "@/components/Dialog";
+import { useMemo, useState } from "react";
+import Badge from "@/components/Badge";
+import { useRouter, useSearchParams } from "next/navigation";
+import { MODELS, PRESETS, byId, defaultRes, estimateUsd, type Mode, type Model } from "@/lib/models";
+import { refreshHistory, useHistory, type Item } from "@/lib/history";
+import Feed from "@/components/Feed";
+import { Chip, Upload } from "@/components/Controls";
+
+const TABS: [Mode, string][] = [["create", "Create"], ["edit", "Edit"], ["motion", "Motion Control"], ["swap", "Genjutsu"]];
+// "16:9"-style option nearest to a width/height ratio.
+const closestAspect = (aspects: string[], ratio: number) =>
+  aspects.filter((a) => /^\d+:\d+$/.test(a)).sort((a, b) => {
+    const r = (x: string) => Math.abs(Math.log(Number(x.split(":")[0]) / Number(x.split(":")[1]) / ratio));
+    return r(a) - r(b);
+  })[0] ?? aspects[0];
+const TIER_LABEL = { free: "Free", budget: "Budget", standard: "Standard", premium: "Premium" };
+type Media = { start?: string; end?: string; video?: string; video2?: string; videoSecs?: number };
+
+export default function Workspace({ kind }: { kind: "video" | "image" | "audio" }) {
+  const sp = useSearchParams();
+  const router = useRouter();
+  const tab: Mode = kind !== "video" ? kind : ((sp.get("tab") as Mode) || "create");
+  const models = MODELS.filter((m) => m.mode === tab);
+
+  const [extendFrom, setExtendFrom] = useState<Item>();
+  const [modelId, setModelId] = useState(sp.get("model") || models[0].id);
+  const picked = byId(modelId);
+  const model = extendFrom ? byId("grok-extend")! : picked?.mode === tab ? picked : models[0];
+  const [prompt, setPrompt] = useState(sp.get("prompt") || "");
+  const [preset, setPreset] = useState(PRESETS[0]);
+  const [dur, setDuration] = useState(0);
+  const [asp, setAspect] = useState("");
+  const [res, setResolution] = useState("");
+  // Fall back to the model's defaults when the chosen option isn't supported by the current model.
+  const duration = model.durations.includes(dur) ? dur : model.durations[0] ?? 0;
+  const aspect = model.aspects.includes(asp) ? asp : model.aspects[0];
+  const resolution = model.resolutions.includes(res) ? res : defaultRes(model);
+  const [audio, setAudio] = useState(true);
+  const [media, setMedia] = useState<Media>({ start: sp.get("start") ?? undefined });
+  // Genjutsu Real People: 15s (one job, video trimmed) or 30s (opt-in: made as 2 parts that are joined afterwards).
+  const [long, setLong] = useState(false);
+  // Higgsfield-style "Images" area (Create video + Image pages): one list of images, used as references when the
+  // model supports them, otherwise image 1 = first frame and image 2 = last frame. Plus reference videos (Seedance, MiniMax).
+  const [images, setImages] = useState<string[]>(sp.get("start") ? [sp.get("start")!] : []);
+  const [refVids, setRefVids] = useState<{ url: string; secs: number }[]>([]);
+  const [asFrame, setAsFrame] = useState(!!sp.get("start")); // "Start the video from image 1" (exact first frame)
+  // Brand name: AI video can't spell reliably, so either lock the spelling in the prompt or keep text out entirely
+  // (and add it afterwards with "✎ Add text", which draws it exactly).
+  const [brand, setBrand] = useState("");
+  const [noText, setNoText] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [picker, setPicker] = useState(false);
+  const [presets, setPresets] = useState(sp.get("presets") === "1");
+  const items = useHistory();
+
+  const unified = (model.mode === "create" || model.mode === "image") && (model.frames !== "none" || !!model.refs);
+  const maxImages = model.refs ?? (model.frames === "start-end" ? 2 : model.frames === "start" ? 1 : 0);
+  // Frames mode: models without references, or the "start from image 1" option (frames and references can't mix).
+  const canFrame = model.frames !== "none" && model.mode === "create";
+  const framesMode = !model.refs || (canFrame && asFrame && images.length <= (model.frames === "start-end" ? 2 : 1) && !refVids.length);
+  const vidSecs = refVids.reduce((t, v) => t + v.secs, 0);
+  const seconds = duration > 0 ? duration : media.videoSecs ?? 10;
+  // Reference videos are billed too (Seedance/MiniMax count their seconds): included so the estimate isn't low.
+  const cost = estimateUsd(model, seconds, resolution, audio && !!model.audio) + (vidSecs && !framesMode ? estimateUsd(model, vidSecs, resolution) : 0);
+  const label = (k: "start" | "end" | "video", fallback: string) => model.labels?.[k] ?? fallback;
+
+  async function generate() {
+    if (media.video2) {
+      // 30s = two separate 15s jobs: the second part can't see the first, so details (e.g. clothes) can change.
+      if (!(await ask({ title: "30 seconds = 2 parts", cost, confirm: `I understand · Pay ≈ $${cost.toFixed(2)}`, tone: "pay",
+        message: "Kling can only make 15 seconds at a time, so your video is made as two 15-second parts. Part 2 starts after part 1 and gets a still from its last moment, but it can't see everything: things that weren't visible (like someone's pants or shoes) may look different in part 2.\n\nWhen both are done, press “Join both parts into one video”." }))) return;
+    } else if (cost > 2 && !(await askToPay(cost))) return;
+    setError("");
+    setBusy(true);
+    // With reference images, tell the video model to keep them faithful (brand colors and logos were drifting).
+    const faithful = unified && !framesMode && images.length && model.mode === "create"
+      ? "Use the reference images faithfully: keep their exact colors, logos, text, products and people." : "";
+    const spelling = model.mode !== "create" ? "" : noText
+      ? "Do not show any written text, letters, numbers, words, captions or logos anywhere in the video."
+      : brand.trim() ? `The brand name is "${brand.trim()}", spelled exactly ${brand.trim().toUpperCase().split("").filter((c) => c !== " ").join("-")}. Any on-screen text must match this spelling letter for letter: never add, drop, swap or change letters. Keep on-screen text short, large and simple.` : "";
+    const fullPrompt = [prompt.trim(), preset.prompt, faithful, spelling].filter(Boolean).join(" ");
+    const pics = unified ? (framesMode ? { start: images[0], end: model.frames === "start-end" ? images[1] : undefined } : { refs: images, refVideos: refVids.map((v) => v.url) })
+      : { start: media.start, end: media.end, refs: model.refs ? images : undefined }; // Edit / Motion / Genjutsu tiles
+    const params = {
+      prompt: fullPrompt, duration, aspect, resolution, audio: audio && !!model.audio,
+      ...pics, video: media.video, taskId: extendFrom?.taskId,
+    };
+    try {
+      // A long video split into 2 parts: part 1 now; part 2 starts when it finishes, using part 1's last frame
+      // as an extra reference so the swapped people look the same (Feed runs that step). Then "Join" them.
+      const split = media.video2 ? { group: crypto.randomUUID(), label: "Part 1/2", next: { video: media.video2, label: "Part 2/2" } } : {};
+      const d = await fetch("/api/generate", { method: "POST", body: JSON.stringify({ modelId: model.id, params, ...split }) }).then((r) => r.json());
+      if (d.error) throw new Error(d.error);
+      setExtendFrom(undefined);
+      await refreshHistory();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const missing = [
+    ...(model.needs ?? []).filter((n) => (unified && n !== "video" ? !images[n === "end" ? 1 : 0] : !media[n])).map((n) => label(n, n === "video" ? "Input video" : n === "end" ? "End frame" : "Start frame")),
+    ...(!prompt.trim() && !model.promptOptional ? ["Prompt"] : []),
+  ];
+  const ready = !missing.length;
+
+  return (
+    <div className="flex flex-col gap-3 p-3 lg:h-[calc(100dvh-3.5rem)] lg:flex-row">
+      {/* ---------- Left control panel ---------- */}
+      <aside className="flex w-full shrink-0 flex-col gap-2 overflow-y-auto rounded-2xl bg-panel p-3 lg:w-[360px]">
+        {kind === "video" && (
+          <div role="tablist" className="flex gap-4 border-b border-line px-1 text-sm font-semibold whitespace-nowrap">
+            {TABS.map(([t, name]) => (
+              <button key={t} role="tab" aria-selected={tab === t} onClick={() => { setExtendFrom(undefined); router.replace(`/video?tab=${t}`); }}
+                className={`-mb-px border-b-2 pb-2 transition-colors ${tab === t ? "border-fg text-fg" : "border-transparent text-muted hover:text-fg"}`}>
+                {name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Preset card (or the clip being extended) */}
+        <div className="relative flex h-28 shrink-0 flex-col justify-end overflow-hidden rounded-xl bg-gradient-to-br from-[#3a2a12] via-[#1d1d1d] to-[#0f2a1f] p-3">
+          {extendFrom ? (
+            <>
+              <button onClick={() => setExtendFrom(undefined)} className="absolute top-2 right-2 rounded-lg bg-black/50 px-2.5 py-1 text-xs font-semibold backdrop-blur hover:bg-black/70">✕ Cancel</button>
+              <div className="text-xl font-black tracking-tight text-lime uppercase">Extend video</div>
+              <div className="line-clamp-1 text-xs text-fg/80">{extendFrom.prompt}</div>
+            </>
+          ) : (
+            <>
+              <button onClick={() => setPresets(true)} className="absolute top-2 right-2 rounded-lg bg-black/50 px-2.5 py-1 text-xs font-semibold backdrop-blur hover:bg-black/70">✎ Change</button>
+              <div className="text-xl font-black tracking-tight text-lime uppercase">{preset.name}</div>
+              <div className="text-xs text-fg/80">{model.name}</div>
+            </>
+          )}
+        </div>
+        {!extendFrom && <p className="px-1 text-xs text-muted">{model.desc}</p>}
+
+        {/* Inputs */}
+        {model.videoSplit && (
+          <div className="flex flex-col gap-1 rounded-xl bg-chip p-2.5">
+            <div className="flex items-center gap-2 text-xs font-semibold text-muted">
+              Length
+              {[false, true].map((l) => (
+                <button key={String(l)} onClick={() => { if (l !== long) { setLong(l); setMedia((m) => ({ ...m, video: undefined, video2: undefined, videoSecs: undefined })); } }}
+                  className={`rounded-lg px-3 py-1 font-bold ${long === l ? "bg-lime text-black" : "bg-line text-fg hover:bg-white/20"}`}>{l ? "30 s" : "15 s"}</button>
+              ))}
+            </div>
+            <p className="text-[11px] text-muted">{long
+              ? "30 s is made as 2 parts of 15 s that you join afterwards. Details the first part never showed (like clothes) can change in part 2."
+              : "One job, up to 15 s. Longer videos are trimmed to the first 15 s."}{media.video ? " Changing the length clears the uploaded video." : ""}</p>
+          </div>
+        )}
+        {((model.frames !== "none" && !unified) || model.needs?.includes("video")) && (
+          <div className="grid grid-cols-2 gap-2">
+            {model.needs?.includes("video") && (
+              <Upload label={label("video", "Input video")} accept="video/*" value={media.video} maxPixels={model.videoMaxPixels} maxSecs={model.videoMaxSecs} minSide={model.videoMinSide} split={model.videoSplit && long}
+                onChange={(video, videoSecs, video2, ratio) => {
+                  setMedia((m) => ({ ...m, video, videoSecs, video2 }));
+                  // Output shape follows the uploaded video (a 9:16 output from a 16:9 video crops people out).
+                  if (ratio && !/auto|adaptive/.test(model.aspects[0])) setAspect(closestAspect(model.aspects, ratio));
+                }} />
+            )}
+            {model.frames !== "none" && !unified && (
+              <Upload label={label("start", kind === "image" ? "Reference" : "Start frame")} accept="image/*"
+                value={media.start} onChange={(start) => setMedia((m) => ({ ...m, start }))} optional={!model.needs?.includes("start")} />
+            )}
+            {model.frames === "start-end" && !unified && (
+              <Upload label={label("end", "End frame")} accept="image/*" value={media.end} onChange={(end) => setMedia((m) => ({ ...m, end }))} optional={!model.needs?.includes("end")} />
+            )}
+          </div>
+        )}
+        {(unified || !!model.refs) && (
+          <ImagesArea images={images} setImages={setImages} max={unified ? maxImages : model.refs!}
+            videos={!framesMode && model.refVideos ? refVids : undefined} setVideos={setRefVids} maxVideos={model.refVideos ?? 0}
+            hint={!unified ? "Reference images · refer to them as “image 1”, “image 2”…"
+              : framesMode && !model.refs ? (model.frames === "start-end" ? "Image 1 = first frame, image 2 = last frame" : "Image 1 = the first frame the video starts from")
+              : framesMode ? "Image 1 is the exact first frame" + (model.frames === "start-end" ? ", image 2 the last frame" : "")
+              : kind === "image" ? "Refer to them in your prompt as “image 1”, “image 2”… (edit, combine, restyle)"
+              : "Used as references: say “image 1”, “image 2”… in your prompt. Their colors, logos and people are kept."}
+            frameToggle={unified && !!model.refs && canFrame ? { on: asFrame, set: setAsFrame } : undefined} />
+        )}
+
+        {model.mode === "create" && (
+          <div className="flex flex-col gap-1.5 rounded-xl bg-chip p-2.5">
+            <label className="flex flex-col gap-1 text-xs font-semibold text-muted">Brand name (optional)
+              <input value={brand} onChange={(e) => setBrand(e.target.value)} disabled={noText} placeholder="e.g. HIGGSVIEW" maxLength={40}
+                className="rounded-lg bg-bg/60 px-2.5 py-1.5 text-sm text-fg outline-none focus:ring-2 focus:ring-lime disabled:opacity-40" />
+            </label>
+            <label className="flex items-center gap-2 text-[11px] text-muted">
+              <input type="checkbox" checked={noText} onChange={(e) => setNoText(e.target.checked)} className="accent-lime" />
+              No text in the video (add your exact name afterwards with ✎ Add text)
+            </label>
+            <p className="text-[11px] text-muted">AI video can misspell words. For a perfect name, use ✎ Add text on the finished video.</p>
+          </div>
+        )}
+
+        {/* Prompt */}
+        <label className="flex flex-col gap-1 rounded-xl bg-chip p-3">
+          <span className="text-xs font-semibold text-muted">Prompt{model.promptOptional && " (optional)"}</span>
+          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={4}
+            placeholder={
+              extendFrom ? "What happens next? e.g. “The camera pulls back to reveal the whole city”"
+                : model.id === "genjutsu-kling" ? "e.g. “Replace the man on the right with the woman in image 1”"
+                : model.id === "genjutsu-swap" ? "What to swap, e.g. “Replace the sneaker with the product in image 1”"
+                : model.id === "genjutsu-motion" ? "e.g. “The woman in image 1 performs this, in the kitchen from image 2”"
+                : model.id === "suno-music" ? "Upbeat modern corporate background music, confident and inspiring, 30 seconds"
+                : model.id === "suno-sfx" ? "Whoosh transition with a deep bass hit"
+                : kind === "audio" ? "Type the words to speak…"
+                : kind === "image" ? "Describe the image you want…"
+                : "Describe the scene, subject, action and camera — e.g. “A sneaker spinning on a wet neon street, slow motion”"}
+            className="resize-none bg-transparent text-sm outline-none placeholder:text-muted/70" />
+        </label>
+
+        {model.audio && (
+          <div className="flex items-center justify-between rounded-xl bg-chip px-3 py-2.5 text-sm">
+            <span>🔊 Audio</span>
+            <button role="switch" aria-checked={audio} aria-label="Generate audio" onClick={() => setAudio(!audio)}
+              className={`relative h-5 w-9 rounded-full transition-colors ${audio ? "bg-lime" : "bg-line"}`}>
+              <span className={`absolute top-0.5 size-4 rounded-full bg-black transition-all ${audio ? "left-[18px]" : "left-0.5"}`} />
+            </button>
+          </div>
+        )}
+
+        {/* Model selector */}
+        {!extendFrom && (
+          <div className="relative">
+            <button onClick={() => setPicker(!picker)} aria-expanded={picker}
+              className="flex w-full items-center justify-between rounded-xl bg-chip px-3 py-2.5 text-left hover:bg-line">
+              <span>
+                <span className="block text-xs text-muted">Model</span>
+                <span className="text-sm font-semibold">{model.name}</span>
+              </span>
+              <span className="text-muted">›</span>
+            </button>
+            {picker && <ModelPicker models={models} value={model.id} onPick={(id) => { setModelId(id); setPicker(false); }} onClose={() => setPicker(false)} />}
+          </div>
+        )}
+
+        {/* Option chips */}
+        <div className="flex flex-wrap gap-2">
+          {model.durations.length > 1 && <Chip label="Duration" value={duration} options={model.durations} fmt={(d) => `${extendFrom ? "+" : ""}${d}s`} onChange={(v) => setDuration(Number(v))} />}
+          {model.durations[0] === -1 && <span className="rounded-lg bg-chip px-3 py-1.5 text-sm text-muted">Length: matches video</span>}
+          {model.aspects.length > 1 && <Chip label="Aspect ratio" value={aspect} options={model.aspects} onChange={setAspect} />}
+          {model.resolutions.length > 1 && <Chip label={model.resLabel ?? "Quality"} value={resolution} options={model.resolutions} onChange={setResolution} />}
+        </div>
+
+        {error && <p role="alert" className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</p>}
+
+        {/* Pinned to the panel bottom so it never scrolls out of view */}
+        <div className="sticky bottom-0 -mx-3 -mb-3 mt-auto flex flex-col gap-1 bg-panel p-3 pt-2">
+          <button onClick={generate} disabled={busy || !ready}
+            className="flex w-full shrink-0 items-center justify-center gap-2 rounded-xl bg-lime py-3.5 font-bold text-black shadow-[0_0_24px_rgba(209,254,23,.25)] transition hover:brightness-110 disabled:opacity-40">
+            {busy ? "Sending…" : extendFrom ? "Extend" : "Generate"} <span className="rounded-md bg-black/10 px-1.5 text-xs">✦ {cost === 0 ? "Free" : `≈$${cost.toFixed(2)}`}</span>
+          </button>
+          {!busy && missing.length > 0 && <p className="text-center text-[11px] text-muted">Add: {missing.join(", ")}</p>}
+        </div>
+      </aside>
+
+      {/* ---------- Right: results ---------- */}
+      <main className="min-h-[60vh] flex-1 overflow-y-auto rounded-2xl bg-panel/40 p-3">
+        <Feed items={items.filter((i) => i.kind === kind || (kind === "video" && i.kind === "image" && byId(i.modelId)?.mode === "swap"))} kind={kind}
+          onReuse={(i) => { setPrompt(i.prompt); if (byId(i.modelId)?.mode === tab) setModelId(i.modelId); }}
+          onContinue={kind === "video" ? (i) => {
+            // Chain clips: the last frame of this clip becomes the start frame of the next (passed in the URL, the page remounts).
+            const m = byId(i.modelId)?.mode === "create" ? i.modelId : "seedance-2-fast";
+            router.push(`/video?tab=create&model=${m}&start=${encodeURIComponent(i.lastFrame!)}`);
+          } : undefined}
+          onExtend={kind === "video" ? (i) => { setExtendFrom(i); setPrompt(""); } : undefined} />
+      </main>
+
+      {presets && <PresetModal onPick={(p) => { setPreset(p); setPresets(false); }} onClose={() => setPresets(false)} />}
+    </div>
+  );
+}
+
+// One place to add images (and reference videos): any number up to the model's limit, numbered for the prompt.
+function ImagesArea({ images, setImages, max, videos, setVideos, maxVideos, hint, frameToggle }: {
+  images: string[]; setImages: (f: (x: string[]) => string[]) => void; max: number;
+  videos?: { url: string; secs: number }[]; setVideos: (f: (x: { url: string; secs: number }[]) => { url: string; secs: number }[]) => void; maxVideos: number;
+  hint: string; frameToggle?: { on: boolean; set: (b: boolean) => void };
+}) {
+  const shown = images.slice(0, max);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="px-1 text-xs font-semibold text-muted">Images ({shown.length}/{max}){videos && ` · Videos (${videos.length}/${maxVideos})`}</span>
+      <div className="grid grid-cols-4 gap-2">
+        {shown.map((r, i) => (
+          <div key={r} className="relative aspect-square overflow-hidden rounded-lg bg-chip">
+            <img src={r} alt={`Image ${i + 1}`} className="size-full object-cover" />
+            <span className="absolute bottom-0.5 left-1 rounded bg-black/60 px-1 text-[10px] font-bold">{i + 1}</span>
+            <button onClick={() => setImages((x) => x.filter((y) => y !== r))} aria-label={`Remove image ${i + 1}`} className="absolute top-0.5 right-0.5 rounded bg-black/70 px-1 text-[10px]">✕</button>
+          </div>
+        ))}
+        {videos?.map((v, i) => (
+          <div key={v.url} className="relative aspect-square overflow-hidden rounded-lg bg-chip">
+            <video src={v.url} muted className="size-full object-cover" />
+            <span className="absolute bottom-0.5 left-1 rounded bg-black/60 px-1 text-[10px] font-bold">▶ {i + 1}</span>
+            <button onClick={() => setVideos((x) => x.filter((y) => y.url !== v.url))} aria-label={`Remove video ${i + 1}`} className="absolute top-0.5 right-0.5 rounded bg-black/70 px-1 text-[10px]">✕</button>
+          </div>
+        ))}
+        {shown.length < max && (
+          <div className="aspect-square"><Upload label="+ Image" accept="image/*" compact onChange={(u) => u && setImages((x) => [...x, u])} /></div>
+        )}
+        {videos && videos.length < maxVideos && (
+          <div className="aspect-square"><Upload label="+ Video" accept="video/*" compact maxSecs={15.5} onChange={(u, secs) => u && setVideos((x) => [...x, { url: u, secs: secs ?? 5 }])} /></div>
+        )}
+      </div>
+      <p className="px-1 text-[11px] text-muted">{hint}</p>
+      {frameToggle && (
+        <label className="flex items-center gap-2 px-1 text-[11px] text-muted">
+          <input type="checkbox" checked={frameToggle.on} onChange={(e) => frameToggle.set(e.target.checked)} className="accent-lime" />
+          Start the video exactly from image 1 (first-frame mode, no references)
+        </label>
+      )}
+    </div>
+  );
+}
+
+function ModelPicker({ models, value, onPick, onClose }: { models: Model[]; value: string; onPick: (id: string) => void; onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const list = useMemo(() => models.filter((m) => m.name.toLowerCase().includes(q.toLowerCase())), [models, q]);
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} />
+      <div className="fixed inset-x-3 bottom-3 z-50 rounded-2xl border border-line bg-[#1a1a1a] p-2 shadow-2xl lg:inset-x-auto lg:top-20 lg:bottom-auto lg:left-[384px] lg:w-[360px]">
+        <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" aria-label="Search models"
+          className="mb-2 w-full rounded-lg bg-chip px-3 py-2 text-sm outline-none" />
+        <p className="px-2 pb-1 text-xs text-muted">✦ Featured models</p>
+        <ul className="max-h-[60vh] overflow-y-auto">
+          {list.map((m) => {
+            const c = estimateUsd(m, m.durations[0] > 0 ? m.durations[0] : 10, m.resolutions[0]); // cheapest setting
+            return (
+              <li key={m.id}>
+                <button onClick={() => onPick(m.id)} className={`flex w-full items-center gap-3 rounded-xl p-2 text-left hover:bg-chip ${m.id === value ? "bg-chip" : ""}`}>
+                  <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-line text-sm">▮▮</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5 text-sm font-semibold">
+                      {m.name}
+                      <Badge label={m.badge} />
+                    </span>
+                    <span className="mt-1 flex flex-wrap gap-1 text-[10px] text-muted">
+                      <span className="rounded bg-line px-1">{m.resolutions.at(-1)}</span>
+                      {m.durations[0] > 0 && <span className="rounded bg-line px-1">{m.durations[0]}s-{m.durations.at(-1)}s</span>}
+                      <span className="rounded bg-line px-1">{TIER_LABEL[m.tier]} · {c === 0 ? "Free" : `from ≈$${c.toFixed(2)}`}</span>
+                    </span>
+                  </span>
+                  {m.id === value && <span className="text-lime">✓</span>}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    </>
+  );
+}
+
+function PresetModal({ onPick, onClose }: { onPick: (p: (typeof PRESETS)[number]) => void; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4" onClick={onClose}>
+      <div role="dialog" aria-label="Presets" className="max-h-[80vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-panel p-4" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-lg font-black uppercase">Presets</h2>
+          <button onClick={onClose} aria-label="Close" className="rounded-lg bg-chip px-2">✕</button>
+        </div>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {PRESETS.map((p, i) => (
+            <button key={p.name} onClick={() => onPick(p)}
+              className="flex aspect-[4/5] flex-col justify-end rounded-xl p-3 text-left ring-lime hover:ring-2"
+              style={{ background: `linear-gradient(160deg, hsl(${(i * 47) % 360} 45% 22%), #111)` }}>
+              <span className="text-sm font-black uppercase">{p.name}</span>
+              <span className="line-clamp-2 text-[11px] text-fg/60">{p.prompt || "Manual control"}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
